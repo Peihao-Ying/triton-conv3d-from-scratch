@@ -30,6 +30,18 @@ After im2col:
   output:        weight_matrix @ input_matrix.T
 ```
 
+## verify_conv3d.py Results
+
+Input: (1, 2, 4, 4, 4), Kernel: (3, 2, 3, 3, 3), Output: (1, 3, 2, 2, 2)
+
+| Method | Description | Max error vs PyTorch |
+|--------|-------------|---------------------|
+| 1 | torch.nn.Conv3d | ground truth |
+| 2 | 7-nested for loops | 0.0000019073 |
+| 3 | im2col + matmul | 0.0000000000 |
+
+Method 2 has tiny error due to floating point accumulation order — this is normal.
+
 ## Next Steps
 - [ ] Learn the Triton vector add tutorial
 - [ ] Learn the Triton matmul tutorial

@@ -7,9 +7,9 @@ Implementing a 3D convolution (Conv3d) Triton GPU kernel from scratch — docume
 | Phase | Directory | Content | Status |
 |-------|-----------|---------|--------|
 | 1 | `01_convolution_basics/` | Understanding convolution, im2col, and matrix multiplication | ✅ |
-| 2 | `02_triton_basics/` | Triton intro: vector add and matmul kernels | ⬜ |
-| 3 | `03_conv3d_naive/` | Explicit im2col + Triton matmul to implement Conv3d | ⬜ |
-| 4 | `04_conv3d_implicit/` | Implicit im2col: fusing address computation into the kernel | ⬜ |
+| 2 | `02_triton_basics/` | Read and understand Triton tutorials | ⬜ |
+| 3 | `03_conv3d_naive/` | Verification: explicit im2col + Triton matmul | ⬜ |
+| 4 | `04_conv3d_implicit/` | Final implementation: implicit im2col Conv3d kernel (main deliverable) | ⬜ |
 
 ## Core Idea
 
@@ -31,6 +31,10 @@ Triton's job is to efficiently perform this matrix multiplication on the GPU.
 - Python 3.10+
 - PyTorch 2.0+
 - Triton 2.0+ (requires NVIDIA GPU)
+
+## Note
+
+Code in this project is written with AI assistance (Claude / Claude Code).
 
 ## References
 
