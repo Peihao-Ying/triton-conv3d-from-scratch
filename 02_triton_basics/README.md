@@ -32,9 +32,10 @@ Every Triton kernel follows the same structure:
 
 > Address computation details (pointer arithmetic, stride calculations) can be handled by AI. Focus on understanding the overall architecture — the 5-step pattern, tiling strategy, and how the K-dimension loop accumulates results.
 
-## TODO
+## Completion Checklist
 
-- [ ] Read and understand the Triton vector add tutorial
-- [ ] Read and understand the Triton matmul tutorial
-- [ ] Understand tiling and BLOCK_SIZE concepts
-- [ ] Identify the 5-step pattern in both tutorials
+- [x] Read and understand the Triton vector add tutorial
+- [x] Read and understand the Triton matmul tutorial
+- [x] Understand tiling and BLOCK_SIZE concepts
+- [x] Identify the 5-step pattern in both tutorials
+- [x] Run matmul tutorial successfully (verified on RTX 5070)

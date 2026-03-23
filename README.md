@@ -7,7 +7,7 @@ Implementing a 3D convolution (Conv3d) Triton GPU kernel from scratch — docume
 | Phase | Directory | Content | Status |
 |-------|-----------|---------|--------|
 | 1 | `01_convolution_basics/` | Understanding convolution, im2col, and matrix multiplication | ✅ |
-| 2 | `02_triton_basics/` | Read and understand Triton tutorials | ⬜ |
+| 2 | `02_triton_basics/` | Read and understand Triton tutorials | ✅ |
 | 3 | `03_conv3d_naive/` | Verification: explicit im2col + Triton matmul | ⬜ |
 | 4 | `04_conv3d_implicit/` | Final implementation: implicit im2col Conv3d kernel (main deliverable) | ⬜ |
 
