@@ -30,24 +30,42 @@ w_in = w_out * stride_w + kw * dilation_w - pad_w
 
 This way, the kernel reads directly from the original input — no im2col matrix needed.
 
-## Implementation Plan
+## Status: Complete
 
-### Step 1: Simplest case
+All three steps implemented and verified.
+
+### Step 1: Simplest case ✅
 - stride=1, padding=0, dilation=1, groups=1
-- Focus on getting the address computation correct inside the K-loop
-- Verify against `torch.nn.Conv3d`
+- Address computation correct inside K-loop
+- Verified against `torch.nn.Conv3d`
 
-### Step 2: Extend to general parameters
-- Support stride > 1
-- Support padding > 0 (with bounds checking for padded regions)
+### Step 2: General parameters ✅
+- stride > 1
+- padding > 0 (with bounds checking for padded regions)
+- dilation > 1
+- 7/7 correctness tests pass
 
-### Step 3: Benchmark
-- Compare performance against `torch.nn.Conv3d`
+### Step 3: Benchmark ✅
 
-## TODO
+Benchmarked on RTX 3080 against `torch.nn.Conv3d` (cuDNN backend):
 
-- [ ] Implement the implicit im2col kernel (stride=1, padding=0, dilation=1, groups=1)
-- [ ] Verify correctness against torch.nn.Conv3d
-- [ ] Support stride > 1
-- [ ] Support padding > 0
-- [ ] Benchmark against torch.nn.Conv3d
+| Case | PyTorch | Triton | Speedup |
+|------|---------|--------|---------|
+| Small first layer | 0.012ms | 0.038ms | 0.32x |
+| Medium mid-net | 0.050ms | 0.054ms | 0.92x |
+| Large deeper | 0.057ms | 0.084ms | 0.69x |
+| Stride=2 downsample | 0.079ms | 0.060ms | **1.31x** |
+| Large high-res | 0.198ms | 0.174ms | **1.14x** |
+
+Competitive with cuDNN on larger inputs and stride=2 workloads. Slower on small problems due to kernel launch overhead and cuDNN's hardware-specific optimizations.
+
+## Files
+
+- `conv3d_implicit.py` — Triton kernel + wrapper function
+- `test_conv3d_implicit.py` — Correctness tests (7 cases)
+- `benchmark.py` — Performance comparison vs PyTorch
+
+## Constraints
+
+- groups=1, batch_size=1
+- float16 `tl.dot` with float32 accumulator
