@@ -28,14 +28,8 @@ Every Triton kernel follows the same structure:
 - `tl.dot`: Block-level matrix multiplication (computes a small matmul per iteration)
 - **Pointer arithmetic with stride**: Navigate multi-dimensional tensors using stride values to compute correct memory addresses
 
-## Note
+## Verified
 
-> Address computation details (pointer arithmetic, stride calculations) can be handled by AI. Focus on understanding the overall architecture — the 5-step pattern, tiling strategy, and how the K-dimension loop accumulates results.
-
-## Completion Checklist
-
-- [x] Read and understand the Triton vector add tutorial
-- [x] Read and understand the Triton matmul tutorial
-- [x] Understand tiling and BLOCK_SIZE concepts
-- [x] Identify the 5-step pattern in both tutorials
-- [x] Run matmul tutorial successfully (verified on RTX 5070)
+- Triton vector add and matmul tutorials studied and executed
+- 5-step pattern, tiling strategy, and K-loop accumulation understood
+- Matmul tutorial verified on RTX 5070

@@ -1,16 +1,16 @@
 # triton-conv3d-from-scratch
 
-Implementing a 3D convolution (Conv3d) Triton GPU kernel from scratch — documenting the full learning journey from "what is convolution" to "writing a high-performance GPU kernel by hand."
+A high-performance 3D convolution (Conv3d) GPU kernel written in Triton, built from first principles. Features implicit im2col fusion, Winograd transform, grouped/depthwise dispatch, and autotuning — benchmarked against cuDNN.
 
-## Learning Roadmap
+## Project Structure
 
-| Phase | Directory | Content | Status |
-|-------|-----------|---------|--------|
-| 1 | `01_convolution_basics/` | Understanding convolution, im2col, and matrix multiplication | ✅ |
-| 2 | `02_triton_basics/` | Read and understand Triton tutorials | ✅ |
-| 3 | `03_conv3d_naive/` | Verification: explicit im2col + Triton matmul | ✅ |
-| 4 | `04_conv3d_implicit/` | Implicit im2col Conv3d kernel — fused address computation | ✅ |
-| 5 | `05_optimization/` | Performance optimization: batch, autotuning, Winograd, groups | ✅ |
+| Phase | Directory | Content |
+|-------|-----------|---------|
+| 1 | `01_convolution_basics/` | Convolution fundamentals, im2col decomposition, correctness verification |
+| 2 | `02_triton_basics/` | Triton programming model — tiling, K-loop, pointer arithmetic |
+| 3 | `03_conv3d_naive/` | Baseline: explicit im2col + Triton matmul |
+| 4 | `04_conv3d_implicit/` | Implicit im2col Conv3d kernel — fused address computation |
+| 5 | `05_optimization/` | 6 optimizations + ultimate kernel with 3 dispatch paths |
 
 ## Core Idea
 
@@ -37,11 +37,11 @@ The ultimate kernel in `05_optimization/conv3d_ultimate.py` combines all optimiz
 
 Supports arbitrary batch size, stride, padding, dilation, and groups. **25/25 tests pass.**
 
-## What I Learned
+## Technical Insights
 
 1. **im2col → GEMM decomposition** is the conceptual foundation. Once you see Conv3d as a matrix multiplication, everything else follows.
 
-2. **Implicit im2col** is the real breakthrough — fusing address computation into the K-loop eliminates the memory-hungry intermediate matrix.
+2. **Implicit im2col** is the core design decision — fusing address computation into the K-loop eliminates the memory-hungry intermediate matrix.
 
 3. **Loop restructuring > micro-optimization.** Splitting the K-loop (outer spatial, inner channel) improves cache behavior more than any amount of faster integer division.
 
@@ -51,6 +51,10 @@ Supports arbitrary batch size, stride, padding, dilation, and groups. **25/25 te
 
 6. **cuDNN is hard to beat on small problems** due to kernel launch overhead and hardware-specific assembly. Custom Triton kernels shine on larger, non-standard workloads (stride > 1, large spatial dims).
 
+## Benchmarks
+
+Benchmarks were run on different GPUs during development (RTX 5070 and RTX 3080). Absolute timings are not comparable across phases — use the speedup ratios (Triton vs cuDNN) for evaluation.
+
 ## Requirements
 
 - Python 3.10+
@@ -59,10 +63,12 @@ Supports arbitrary batch size, stride, padding, dilation, and groups. **25/25 te
 
 ## Note
 
-Code in this project is written with AI assistance (Claude / Claude Code).
+Developed with AI-assisted development tools.
 
 ## References
 
+- [Implicit GEMM Convolution](https://github.com/NVIDIA/cutlass/blob/main/media/docs/implicit_gemm_convolution.md) — NVIDIA CUTLASS documentation on fusing im2col into GEMM
+- [cuDNN: Efficient Primitives for Deep Learning](https://arxiv.org/abs/1410.0759) — Chetlur et al., 2014
 - [Triton Language API](https://triton-lang.org/main/python-api/triton.language.html)
 - [Triton Tutorials](https://triton-lang.org/main/getting-started/tutorials/index.html)
 - [PyTorch Conv3d Docs](https://docs.pytorch.org/docs/stable/generated/torch.nn.Conv3d.html)

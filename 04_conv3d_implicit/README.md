@@ -30,24 +30,13 @@ w_in = w_out * stride_w + kw * dilation_w - pad_w
 
 This way, the kernel reads directly from the original input — no im2col matrix needed.
 
-## Status: Complete
+## Implementation
 
-All three steps implemented and verified.
+Supports arbitrary stride, padding, and dilation with bounds checking for padded regions. 7/7 correctness tests pass against `torch.nn.Conv3d`.
 
-### Step 1: Simplest case ✅
-- stride=1, padding=0, dilation=1, groups=1
-- Address computation correct inside K-loop
-- Verified against `torch.nn.Conv3d`
+### Benchmark
 
-### Step 2: General parameters ✅
-- stride > 1
-- padding > 0 (with bounds checking for padded regions)
-- dilation > 1
-- 7/7 correctness tests pass
-
-### Step 3: Benchmark ✅
-
-Benchmarked on RTX 3080 against `torch.nn.Conv3d` (cuDNN backend):
+RTX 3080, compared against `torch.nn.Conv3d` (cuDNN backend):
 
 | Case | PyTorch | Triton | Speedup |
 |------|---------|--------|---------|

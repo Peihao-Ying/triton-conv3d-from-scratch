@@ -59,7 +59,7 @@ reshape → (C_out, D_out, H_out, W_out)
 python verify_conv3d.py
 ```
 
-Three methods:
+Three methods verified against each other:
 1. `torch.nn.Conv3d` (ground truth)
-2. 7-nested for loops (most intuitive)
-3. im2col + matrix multiplication (this is what Triton will accelerate)
+2. 7-nested for loops (reference implementation)
+3. im2col + matrix multiplication (foundation for Triton acceleration)

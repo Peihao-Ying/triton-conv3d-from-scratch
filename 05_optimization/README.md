@@ -249,9 +249,9 @@ Tolerance: `max(2e-2, sqrt(K) * 2e-3)` for general path, `max(5e-2, C_in * 5e-3)
 - `benchmark_ultimate.py` — Performance benchmarks vs cuDNN
 - `01_batch_parallel/` through `06_groups/` — Each optimization in isolation
 
-## What We Learned
+## Design Insights
 
-1. **Implicit im2col is the core insight.** Computing addresses on-the-fly inside the K-loop eliminates the intermediate matrix. Everything else is polish on top of this idea.
+1. **Implicit im2col is the core design decision.** Computing addresses on-the-fly inside the K-loop eliminates the intermediate matrix. Everything else is polish on top of this idea.
 
 2. **Restructuring loops matters more than micro-optimizing arithmetic.** The split K-loop (opt 4) improves memory access patterns fundamentally — no amount of faster integer division can compensate for cache misses.
 

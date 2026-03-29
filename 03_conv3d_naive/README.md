@@ -32,9 +32,4 @@ cd 03_conv3d_naive
 python test_conv3d.py
 ```
 
-## Completed
-
-- [x] Write the im2col function
-- [x] Use Triton matmul kernel for the GEMM step
-- [x] Combine into a complete conv3d_triton function
-- [x] Verify correctness against torch.nn.Conv3d
+Correctness verified against `torch.nn.Conv3d`.

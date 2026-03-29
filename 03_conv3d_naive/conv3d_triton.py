@@ -21,7 +21,9 @@ from im2col import im2col_3d
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 # ============================================================
-# Triton matmul kernel — copied as-is from 02_triton_basics/matmul_tutorial.py
+# Triton matmul kernel — copied from 02_triton_basics/matmul_tutorial.py
+# (intentionally duplicated so this phase is self-contained and runnable
+# without cross-directory imports)
 # ============================================================
 
 
