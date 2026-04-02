@@ -1,7 +1,8 @@
 """
-Benchmark: ultimate Conv3D vs PyTorch nn.Conv3d.
+Benchmark: ultimate Conv3D (v2) vs PyTorch nn.Conv3d (cuDNN).
 
-Tests all dispatch paths across various problem sizes and batch sizes.
+Tests general path across batch sizes 1/4/8, plus grouped and depthwise.
+100 iterations, median timing.
 """
 
 import torch
@@ -10,8 +11,8 @@ import torch.nn as nn
 from conv3d_ultimate import conv3d_ultimate, DEVICE
 
 
-def benchmark_fn(fn, warmup=10, repeat=50):
-    """Benchmark using CUDA events for accurate GPU timing."""
+def benchmark_fn(fn, warmup=10, repeat=100):
+    """Benchmark using CUDA events. Returns median time in ms."""
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -40,18 +41,11 @@ def run_benchmark(label, batch_size, C_in, C_out, D, H, W, kD, kH, kW,
     if isinstance(dilation, int):
         dilation = (dilation, dilation, dilation)
 
-    print(f"\n{'='*60}")
-    print(f"{label}")
-    print(f"Input: ({batch_size},{C_in},{D},{H},{W})  "
-          f"Kernel: ({C_out},{C_in // groups},{kD},{kH},{kW})")
-    print(f"stride={stride}  padding={padding}  dilation={dilation}  groups={groups}")
-
     torch.manual_seed(42)
     x = torch.randn(batch_size, C_in, D, H, W, device=DEVICE)
     weight = torch.randn(C_out, C_in // groups, kD, kH, kW, device=DEVICE)
     bias = torch.randn(C_out, device=DEVICE)
 
-    # PyTorch Conv3d
     conv = nn.Conv3d(C_in, C_out, (kD, kH, kW),
                      stride=stride, padding=padding, dilation=dilation,
                      groups=groups, bias=True).to(DEVICE)
@@ -60,125 +54,91 @@ def run_benchmark(label, batch_size, C_in, C_out, D, H, W, kD, kH, kW,
         conv.bias.copy_(bias)
 
     pytorch_ms = benchmark_fn(lambda: conv(x))
-
-    # Our ultimate kernel
     triton_ms = benchmark_fn(
         lambda: conv3d_ultimate(x, weight, bias,
                                 stride=stride, padding=padding,
                                 dilation=dilation, groups=groups))
 
     speedup = pytorch_ms / triton_ms
-    tag = "(Triton faster)" if speedup > 1 else "(PyTorch faster)"
-    print(f"PyTorch:  {pytorch_ms:8.3f} ms")
-    print(f"Triton:   {triton_ms:8.3f} ms")
-    print(f"Speedup:  {speedup:.2f}x {tag}")
+    tag = "Triton" if speedup > 1 else "cuDNN"
+    print(f"  {label:<45} {pytorch_ms:>7.3f}ms {triton_ms:>7.3f}ms {speedup:>7.2f}x  {tag}")
 
     return label, pytorch_ms, triton_ms
 
 
-# ============================================================
-# Benchmark suite
-# ============================================================
-
-print("Ultimate Conv3D Benchmark")
-print(f"Device: {DEVICE}")
-print(f"GPU: {torch.cuda.get_device_name()}")
+print("=" * 90)
+print("  Ultimate Conv3D v2 Benchmark")
+print(f"  GPU: {torch.cuda.get_device_name()}")
+print(f"  Kernel: flat K-loop + expanded autotuning + batch/group parallelism")
+print(f"  Timing: CUDA events, 100 iterations, median")
+print("=" * 90)
 
 results = []
 
-# --- Original Phase 4 benchmarks (batch=1) ---
-print("\n" + "#" * 60)
-print("# ORIGINAL PHASE 4 SIZES (batch=1, groups=1)")
-print("#" * 60)
+# ── batch=1, groups=1 ──
+print(f"\n  {'Case':<45} {'cuDNN':>8} {'Triton':>8} {'Speedup':>8}  {'Winner'}")
+print(f"  {'─'*45} {'─'*8} {'─'*8} {'─'*8}  {'─'*6}")
 
-results.append(run_benchmark(
-    "Small first layer (b=1)",
-    1, 1, 16, 16, 16, 16, 3, 3, 3, padding=1))
+print(f"\n  ── batch=1, groups=1 ──")
+results.append(run_benchmark("S1: tiny 1->16, 16^3", 1, 1, 16, 16, 16, 16, 3, 3, 3, padding=1))
+results.append(run_benchmark("S2: small 3->32, 16^3", 1, 3, 32, 16, 16, 16, 3, 3, 3, padding=1))
+results.append(run_benchmark("M1: mid-net 32->64, 16^3", 1, 32, 64, 16, 16, 16, 3, 3, 3, padding=1))
+results.append(run_benchmark("M2: mid-net 64->128, 8x16x16", 1, 64, 128, 8, 16, 16, 3, 3, 3, padding=1))
+results.append(run_benchmark("M3: stride=2, 32->64, 16x32x32", 1, 32, 64, 16, 32, 32, 3, 3, 3, stride=2, padding=1))
+results.append(run_benchmark("L1: high-res 16->32, 32^3", 1, 16, 32, 32, 32, 32, 3, 3, 3, padding=1))
+results.append(run_benchmark("L2: high-res 16->32, 48^3", 1, 16, 32, 48, 48, 48, 3, 3, 3, padding=1))
+results.append(run_benchmark("L3: high-res 16->32, 64^3", 1, 16, 32, 64, 64, 64, 3, 3, 3, padding=1))
+results.append(run_benchmark("L4: high-res 64^3 stride=2", 1, 16, 32, 64, 64, 64, 3, 3, 3, stride=2, padding=1))
+results.append(run_benchmark("C1: wide 128->128, 16^3", 1, 128, 128, 16, 16, 16, 3, 3, 3, padding=1))
+results.append(run_benchmark("C2: wide 128->256, 16^3", 1, 128, 256, 16, 16, 16, 3, 3, 3, padding=1))
+results.append(run_benchmark("C3: wide 256->256, 8^3", 1, 256, 256, 8, 8, 8, 3, 3, 3, padding=1))
+results.append(run_benchmark("X1: stress 64->128, 32^3", 1, 64, 128, 32, 32, 32, 3, 3, 3, padding=1))
+results.append(run_benchmark("X2: stress 64->128, 32^3 stride=2", 1, 64, 128, 32, 32, 32, 3, 3, 3, stride=2, padding=1))
 
-results.append(run_benchmark(
-    "Medium mid-net (b=1)",
-    1, 32, 64, 16, 16, 16, 3, 3, 3, padding=1))
+# ── batch=4, groups=1 ──
+print(f"\n  ── batch=4, groups=1 ──")
+results.append(run_benchmark("M1: mid-net 32->64, 16^3 b=4", 4, 32, 64, 16, 16, 16, 3, 3, 3, padding=1))
+results.append(run_benchmark("M3: stride=2, 32->64 b=4", 4, 32, 64, 16, 32, 32, 3, 3, 3, stride=2, padding=1))
+results.append(run_benchmark("L1: high-res 16->32, 32^3 b=4", 4, 16, 32, 32, 32, 32, 3, 3, 3, padding=1))
+results.append(run_benchmark("L3: high-res 16->32, 64^3 b=4", 4, 16, 32, 64, 64, 64, 3, 3, 3, padding=1))
+results.append(run_benchmark("C1: wide 128->128, 16^3 b=4", 4, 128, 128, 16, 16, 16, 3, 3, 3, padding=1))
+results.append(run_benchmark("X2: stress 64->128, 32^3 s2 b=4", 4, 64, 128, 32, 32, 32, 3, 3, 3, stride=2, padding=1))
 
-results.append(run_benchmark(
-    "Large deeper (b=1)",
-    1, 64, 128, 8, 16, 16, 3, 3, 3, padding=1))
+# ── batch=8, groups=1 ──
+print(f"\n  ── batch=8, groups=1 ──")
+results.append(run_benchmark("M1: mid-net 32->64, 16^3 b=8", 8, 32, 64, 16, 16, 16, 3, 3, 3, padding=1))
+results.append(run_benchmark("L1: high-res 16->32, 32^3 b=8", 8, 16, 32, 32, 32, 32, 3, 3, 3, padding=1))
+results.append(run_benchmark("X2: stress 64->128, 32^3 s2 b=8", 8, 64, 128, 32, 32, 32, 3, 3, 3, stride=2, padding=1))
 
-results.append(run_benchmark(
-    "Stride=2 downsample (b=1)",
-    1, 32, 64, 16, 32, 32, 3, 3, 3, stride=2, padding=1))
+# ── grouped convolution ──
+print(f"\n  ── grouped convolution ──")
+results.append(run_benchmark("groups=2, 32->64, 16^3 b=4", 4, 32, 64, 16, 16, 16, 3, 3, 3, padding=1, groups=2))
+results.append(run_benchmark("groups=4, 64->128, 16^3 b=4", 4, 64, 128, 16, 16, 16, 3, 3, 3, padding=1, groups=4))
 
-results.append(run_benchmark(
-    "Large high-res (b=1)",
-    1, 16, 32, 32, 32, 32, 3, 3, 3, padding=1))
+# ── depthwise ──
+print(f"\n  ── depthwise ──")
+results.append(run_benchmark("depthwise C=32, 16^3 b=4", 4, 32, 32, 16, 16, 16, 3, 3, 3, padding=1, groups=32))
+results.append(run_benchmark("depthwise C=64, 16x32x32 b=4", 4, 64, 64, 16, 32, 32, 3, 3, 3, padding=1, groups=64))
 
-# --- Batched versions ---
-print("\n" + "#" * 60)
-print("# BATCHED (batch=4, groups=1)")
-print("#" * 60)
+# ── non-standard kernels ──
+print(f"\n  ── non-standard kernels ──")
+results.append(run_benchmark("5x5x5, 32->64, 16^3 b=1", 1, 32, 64, 16, 16, 16, 5, 5, 5, padding=2))
+results.append(run_benchmark("1x1x1 pointwise, 128->256 b=1", 1, 128, 256, 16, 16, 16, 1, 1, 1))
 
-results.append(run_benchmark(
-    "Medium mid-net (b=4)",
-    4, 32, 64, 16, 16, 16, 3, 3, 3, padding=1))
+# ── Summary ──
+print(f"\n{'='*90}")
+print("  Summary")
+print(f"{'='*90}")
+print(f"  {'Case':<45} {'cuDNN':>8} {'Triton':>8} {'Speedup':>8}")
+print(f"  {'─'*45} {'─'*8} {'─'*8} {'─'*8}")
 
-results.append(run_benchmark(
-    "Large deeper (b=4)",
-    4, 64, 128, 8, 16, 16, 3, 3, 3, padding=1))
-
-results.append(run_benchmark(
-    "Stride=2 downsample (b=4)",
-    4, 32, 64, 16, 32, 32, 3, 3, 3, stride=2, padding=1))
-
-results.append(run_benchmark(
-    "Large high-res (b=4)",
-    4, 16, 32, 32, 32, 32, 3, 3, 3, padding=1))
-
-# --- Grouped convolution ---
-print("\n" + "#" * 60)
-print("# GROUPED CONVOLUTION")
-print("#" * 60)
-
-results.append(run_benchmark(
-    "Groups=4 (b=4)",
-    4, 64, 128, 16, 16, 16, 3, 3, 3, padding=1, groups=4))
-
-results.append(run_benchmark(
-    "Groups=32 ResNeXt-style (b=4)",
-    4, 128, 128, 8, 16, 16, 3, 3, 3, padding=1, groups=32))
-
-# --- Depthwise ---
-print("\n" + "#" * 60)
-print("# DEPTHWISE CONVOLUTION")
-print("#" * 60)
-
-results.append(run_benchmark(
-    "Depthwise C=32 (b=4)",
-    4, 32, 32, 16, 16, 16, 3, 3, 3, padding=1, groups=32))
-
-results.append(run_benchmark(
-    "Depthwise C=64 large (b=4)",
-    4, 64, 64, 16, 32, 32, 3, 3, 3, padding=1, groups=64))
-
-results.append(run_benchmark(
-    "Depthwise stride=2 (b=4)",
-    4, 32, 32, 16, 32, 32, 3, 3, 3, stride=2, padding=1, groups=32))
-
-# --- Non-3x3x3 (general path) ---
-print("\n" + "#" * 60)
-print("# NON-3x3x3 KERNEL")
-print("#" * 60)
-
-results.append(run_benchmark(
-    "5x5x5 kernel (b=1)",
-    1, 16, 32, 16, 16, 16, 5, 5, 5, padding=2))
-
-# Summary
-print(f"\n{'='*70}")
-print("SUMMARY")
-print(f"{'Case':<40} {'PyTorch':>10} {'Triton':>10} {'Speedup':>10}")
-print("-" * 70)
+triton_wins = 0
 for label, pt, tr in results:
-    speedup = pt / tr
-    marker = " *" if speedup >= 1.0 else ""
-    print(f"{label:<40} {pt:>8.3f}ms {tr:>8.3f}ms {speedup:>8.2f}x{marker}")
-print("-" * 70)
-print("* = Triton faster or equal")
+    sp = pt / tr
+    marker = " <-" if sp > 1 else ""
+    print(f"  {label:<45} {pt:>7.3f}ms {tr:>7.3f}ms {sp:>7.2f}x{marker}")
+    if sp > 1:
+        triton_wins += 1
+
+print(f"\n  Triton faster in {triton_wins}/{len(results)} cases")
+print(f"{'='*90}")

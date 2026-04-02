@@ -1,26 +1,23 @@
 """
-Ultimate Conv3D — combines all six Phase 5 optimizations into one kernel.
+Ultimate Conv3D — combines batch parallelism, expanded autotuning, grouped
+convolution, and depthwise specialization.
 
-Three dispatch paths:
+Two dispatch paths:
 
-  Path 1 — Winograd F(2x2x2, 3x3x3):
-    For 3x3x3 kernels with stride=1, dilation=1, groups=1.
-    Reduces multiplies from 27 to 8 per output element.
-
-  Path 2 — Depthwise:
-    For groups == C_in == C_out.  Each channel has one filter.
+  Path 1 — Depthwise:
+    For groups == C_in == C_out. Each channel has one filter.
     Simple dot-product reduction (no tl.dot needed).
 
-  Path 3 — General optimized:
-    Combines batch parallelism (opt 1), expanded autotuning (opt 2),
-    constexpr kernel dims (opt 3), split K-loop for data reuse (opt 4),
-    and grouped convolution (opt 6) into one kernel.
-    3D grid: (tiles, batch, groups).
+  Path 2 — General optimized:
+    Phase 4 flat K-loop (implicit im2col) with expanded autotuning (~20 configs)
+    and batch + group parallelism via 3D grid: (tiles, batch, groups).
 
-All paths support arbitrary batch size.
+Design decisions based on benchmark data (RTX 3080):
+  - Flat K-loop beats split K-loop (opt 4 was 5-6x slower)
+  - Winograd removed (opt 5 was 10-30x slower on all tested sizes)
+  - constexpr kernel dims removed (opt 3 was 4-17% slower)
+  - Expanded autotuning is the only pure performance win (~1.7x on large high-res)
 """
-
-import math
 
 import torch
 import triton
@@ -30,7 +27,7 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
 # ============================================================
-# Expanded autotune configs (~20 configs) for the general kernel
+# Expanded autotune configs (~20 configs)
 # ============================================================
 
 def get_general_autotune_config():
@@ -131,14 +128,12 @@ def get_depthwise_autotune_config():
 
 
 # ============================================================
-# Path 3: General optimized kernel
-# Combines: batch parallel + expanded autotuning + constexpr dims
-#           + split K-loop + groups
+# General kernel: flat K-loop + batch + groups + expanded autotuning
 # ============================================================
 
 @triton.autotune(
     configs=get_general_autotune_config(),
-    key=["M_g", "N", "C_in_g"],
+    key=["M_g", "N", "K"],
 )
 @triton.jit
 def conv3d_general_kernel(
@@ -149,7 +144,7 @@ def conv3d_general_kernel(
     # Per-group matrix dimensions
     M_g,      # C_out // groups
     N,        # D_out * H_out * W_out  (total output positions)
-    C_in_g,   # C_in // groups (inner loop bound)
+    K,        # C_in_g * kD * kH * kW  (flattened kernel volume per group)
     # Weight (A-side) strides
     stride_wm, stride_wk,
     # Output (C-side) strides
@@ -158,30 +153,27 @@ def conv3d_general_kernel(
     # Input strides — layout (N_batch, C_in, D, H, W)
     stride_ib,  # batch stride in input
     stride_ic, stride_id, stride_ih, stride_iw,
-    # Input spatial dims (for bounds checking with padding)
+    # Input spatial dims
     D, H, W,
-    # Pre-computed H_out * W_out
-    HW_out,
+    # Convolution geometry
+    kD, kH, kW,
     H_out, W_out,
     # Stride, padding, dilation
     stride_d, stride_h, stride_w,
     pad_d, pad_h, pad_w,
     dil_d, dil_h, dil_w,
-    # Constexpr kernel dimensions — enables constant folding + loop unrolling
-    kD: tl.constexpr,
-    kH: tl.constexpr,
-    kW: tl.constexpr,
+    # Group channel offset
+    C_in_g,   # C_in // groups
     # Autotune constexprs
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
-    """Fully optimized Conv3d kernel.
+    """Implicit im2col Conv3d with batch + group parallelism.
 
     3D grid: (tiles, N_batch, groups).
-    Split K-loop: outer over (kd, kh, kw) unrolled at compile time,
-    inner over channel blocks for contiguous memory access.
+    Uses Phase 4 flat K-loop — proven faster than split K-loop on RTX 3080.
     """
     # --- Batch and group indices from grid ---
     batch_idx = tl.program_id(axis=1)
@@ -208,58 +200,52 @@ def conv3d_general_kernel(
     offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-    # --- Pre-loop: decompose offs_n into output spatial coords (done once) ---
+    # --- A-side (weight) pointer setup ---
+    weight_ptrs = weight_ptr + (offs_m[:, None] * stride_wm + offs_k[None, :] * stride_wk)
+
+    # --- Pre-loop: decompose offs_n into output spatial coords ---
+    HW_out = H_out * W_out
     d_out = offs_n // HW_out
     h_out = (offs_n % HW_out) // W_out
     w_out = offs_n % W_out
 
-    # --- Accumulator ---
+    # --- Flat K-loop: accumulate tiles ---
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    kHW: tl.constexpr = kH * kW
-    kDHW: tl.constexpr = kD * kHW
+    kHW = kH * kW
+    kDHW = kD * kHW
 
-    # --- Split K-loop: outer over spatial (unrolled), inner over channels ---
-    for kd_val in range(kD):
-        for kh_val in range(kH):
-            for kw_val in range(kW):
-                # Input spatial coords — same for all ci in this iteration
-                d_in = d_out * stride_d + kd_val * dil_d - pad_d
-                h_in = h_out * stride_h + kh_val * dil_h - pad_h
-                w_in = w_out * stride_w + kw_val * dil_w - pad_w
+    for k_block in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_indices = offs_k + k_block * BLOCK_SIZE_K
+        k_mask = k_indices < K
 
-                # Bounds check (computed once per spatial position)
-                spatial_valid = ((d_in >= 0) & (d_in < D)
-                                 & (h_in >= 0) & (h_in < H)
-                                 & (w_in >= 0) & (w_in < W))
+        # A-side: load weight tile
+        a = tl.load(weight_ptrs, mask=k_mask[None, :], other=0.0)
 
-                # Base address for this spatial position (without channel offset)
-                base_addr = d_in * stride_id + h_in * stride_ih + w_in * stride_iw
+        # B-side: implicit im2col — compute input addresses on-the-fly
+        ci = k_indices // kDHW
+        rem = k_indices % kDHW
+        kd_val = rem // kHW
+        kh_val = (rem % kHW) // kW
+        kw_val = rem % kW
 
-                # Weight k-offset base for this (kd, kh, kw)
-                k_spatial_offset = kd_val * kHW + kh_val * kW + kw_val
+        d_in = d_out[None, :] * stride_d + kd_val[:, None] * dil_d - pad_d
+        h_in = h_out[None, :] * stride_h + kh_val[:, None] * dil_h - pad_h
+        w_in = w_out[None, :] * stride_w + kw_val[:, None] * dil_w - pad_w
 
-                # Inner loop: sweep input channels in blocks of BLOCK_SIZE_K
-                for ci_block in range(0, tl.cdiv(C_in_g, BLOCK_SIZE_K)):
-                    ci_indices = ci_block * BLOCK_SIZE_K + offs_k
-                    ci_mask = ci_indices < C_in_g
+        valid = ((d_in >= 0) & (d_in < D)
+                 & (h_in >= 0) & (h_in < H)
+                 & (w_in >= 0) & (w_in < W))
 
-                    # B-side: input load — contiguous along channel dim
-                    input_addrs = ci_indices[:, None] * stride_ic + base_addr[None, :]
-                    b = tl.load(input_ptr + input_addrs,
-                                mask=ci_mask[:, None] & spatial_valid[None, :],
-                                other=0.0,
-                                eviction_policy="evict_last")
+        input_addrs = (ci[:, None] * stride_ic
+                       + d_in * stride_id
+                       + h_in * stride_ih
+                       + w_in * stride_iw)
 
-                    # A-side: weight load
-                    # k = ci * kDHW + kd * kHW + kh * kW + kw
-                    k_offset = ci_indices * kDHW + k_spatial_offset
-                    weight_addrs = offs_m[:, None] * stride_wm + k_offset[None, :] * stride_wk
-                    a = tl.load(weight_ptr + weight_addrs,
-                                mask=ci_mask[None, :],
-                                other=0.0)
+        b = tl.load(input_ptr + input_addrs, mask=k_mask[:, None] & valid, other=0.0)
 
-                    # Accumulate
-                    accumulator = tl.dot(a.to(tl.float16), b.to(tl.float16), accumulator)
+        accumulator = tl.dot(a.to(tl.float16), b.to(tl.float16), accumulator)
+
+        weight_ptrs += BLOCK_SIZE_K * stride_wk
 
     # --- Store output tile ---
     c = accumulator.to(tl.float32)
@@ -271,7 +257,7 @@ def conv3d_general_kernel(
 
 
 # ============================================================
-# Path 2: Depthwise kernel (with batch support)
+# Depthwise kernel (with batch support)
 # ============================================================
 
 @triton.autotune(
@@ -360,170 +346,11 @@ def conv3d_depthwise_kernel(
 
 
 # ============================================================
-# Path 1: Winograd F(2x2x2, 3x3x3)
-# ============================================================
-
-# 1D transform matrices
-_G = torch.tensor([
-    [1.0,  0.0,  0.0],
-    [0.5,  0.5,  0.5],
-    [0.5, -0.5,  0.5],
-    [0.0,  0.0,  1.0],
-], dtype=torch.float32)
-
-_BT = torch.tensor([
-    [1.0,  0.0, -1.0,  0.0],
-    [0.0,  1.0,  1.0,  0.0],
-    [0.0, -1.0,  1.0,  0.0],
-    [0.0,  1.0,  0.0, -1.0],
-], dtype=torch.float32)
-
-_AT = torch.tensor([
-    [1.0,  1.0,  1.0,  0.0],
-    [0.0,  1.0, -1.0, -1.0],
-], dtype=torch.float32)
-
-
-def _transform_3d(tensor, matrix):
-    """Apply a separable transform along the last 3 dims."""
-    t = torch.einsum("ia,...ayz->...iyz", matrix, tensor)
-    t = torch.einsum("jb,...xbz->...xjz", matrix, t)
-    t = torch.einsum("kc,...xyc->...xyk", matrix, t)
-    return t
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=4, num_warps=4),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=4, num_warps=4),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 32}, num_stages=4, num_warps=4),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 32}, num_stages=5, num_warps=2),
-    ],
-    key=["M_dim", "N_dim", "K_dim"],
-)
-@triton.jit
-def winograd_batched_matmul_kernel(
-    U_ptr, V_ptr, M_ptr,
-    M_dim, N_dim, K_dim,
-    stride_u_m, stride_u_k, stride_u_p,
-    stride_v_n, stride_v_k, stride_v_p,
-    stride_m_n, stride_m_m, stride_m_p,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    """64 independent matmuls — one per Winograd domain position."""
-    pid_p = tl.program_id(axis=1)
-    pid_mn = tl.program_id(axis=0)
-    num_pid_n = tl.cdiv(N_dim, BLOCK_N)
-    pid_m = pid_mn // num_pid_n
-    pid_n = pid_mn % num_pid_n
-
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-
-    u_ptrs = U_ptr + (offs_m[:, None] * stride_u_m + offs_k[None, :] * stride_u_k + pid_p * stride_u_p)
-    v_ptrs = V_ptr + (offs_n[:, None] * stride_v_n + offs_k[None, :] * stride_v_k + pid_p * stride_v_p)
-
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k_start in range(0, tl.cdiv(K_dim, BLOCK_K)):
-        k_offs = offs_k + k_start * BLOCK_K
-        k_mask = k_offs < K_dim
-        u = tl.load(u_ptrs, mask=(offs_m[:, None] < M_dim) & k_mask[None, :], other=0.0)
-        v = tl.load(v_ptrs, mask=(offs_n[:, None] < N_dim) & k_mask[None, :], other=0.0)
-        acc = tl.dot(u.to(tl.float16), tl.trans(v).to(tl.float16), acc)
-        u_ptrs += BLOCK_K * stride_u_k
-        v_ptrs += BLOCK_K * stride_v_k
-
-    offs_cm = offs_m
-    offs_cn = offs_n
-    m_ptrs = M_ptr + (offs_cn[None, :] * stride_m_n + offs_cm[:, None] * stride_m_m + pid_p * stride_m_p)
-    m_mask = (offs_cm[:, None] < M_dim) & (offs_cn[None, :] < N_dim)
-    tl.store(m_ptrs, acc, mask=m_mask)
-
-
-def _conv3d_winograd(input_dev, weight_dev, bias, padding):
-    """Winograd F(2x2x2, 3x3x3) Conv3D. Supports arbitrary batch size."""
-    N_batch, C_in, D, H, W = input_dev.shape
-    C_out = weight_dev.shape[0]
-    pD, pH, pW = padding
-
-    D_out = D + 2 * pD - 2
-    H_out = H + 2 * pH - 2
-    W_out = W + 2 * pW - 2
-
-    G_dev = _G.to(device=input_dev.device)
-    BT_dev = _BT.to(device=input_dev.device)
-    AT_dev = _AT.to(device=input_dev.device)
-
-    # Pad input
-    if pD > 0 or pH > 0 or pW > 0:
-        input_dev = torch.nn.functional.pad(input_dev, (pW, pW, pH, pH, pD, pD))
-
-    # Tile counts
-    tile_d = math.ceil(D_out / 2)
-    tile_h = math.ceil(H_out / 2)
-    tile_w = math.ceil(W_out / 2)
-    num_tiles = tile_d * tile_h * tile_w
-
-    # Extra padding so tile extraction doesn't overflow
-    D_pad, H_pad, W_pad = D + 2 * pD, H + 2 * pH, W + 2 * pW
-    extra_d = max(0, tile_d * 2 + 2 - D_pad)
-    extra_h = max(0, tile_h * 2 + 2 - H_pad)
-    extra_w = max(0, tile_w * 2 + 2 - W_pad)
-    if extra_d > 0 or extra_h > 0 or extra_w > 0:
-        input_dev = torch.nn.functional.pad(input_dev, (0, extra_w, 0, extra_h, 0, extra_d))
-
-    # Filter transform (once)
-    U = _transform_3d(weight_dev, G_dev)  # (C_out, C_in, 4, 4, 4)
-
-    # Extract tiles and transform
-    patches = input_dev.unfold(2, 4, 2).unfold(3, 4, 2).unfold(4, 4, 2)
-    patches = patches.contiguous().reshape(N_batch, C_in, num_tiles, 4, 4, 4)
-    V = _transform_3d(patches, BT_dev)
-
-    # Batched matmul via Triton
-    U_flat = U.reshape(C_out, C_in, 64).contiguous()
-    V_perm = V.permute(0, 2, 1, 3, 4, 5).contiguous()
-    V_flat = V_perm.reshape(N_batch * num_tiles, C_in, 64).contiguous()
-    M_flat = torch.empty((N_batch * num_tiles, C_out, 64), device=input_dev.device, dtype=torch.float32)
-
-    grid = lambda META: (
-        triton.cdiv(C_out, META["BLOCK_M"]) * triton.cdiv(N_batch * num_tiles, META["BLOCK_N"]),
-        64,
-    )
-    winograd_batched_matmul_kernel[grid](
-        U_flat, V_flat, M_flat,
-        C_out, N_batch * num_tiles, C_in,
-        U_flat.stride(0), U_flat.stride(1), U_flat.stride(2),
-        V_flat.stride(0), V_flat.stride(1), V_flat.stride(2),
-        M_flat.stride(0), M_flat.stride(1), M_flat.stride(2),
-    )
-
-    # Output transform
-    M_tensor = M_flat.reshape(N_batch, num_tiles, C_out, 4, 4, 4)
-    M_tensor = M_tensor.permute(0, 2, 1, 3, 4, 5).contiguous()
-    Y = _transform_3d(M_tensor, AT_dev)
-
-    # Stitch tiles
-    Y = Y.reshape(N_batch, C_out, tile_d, tile_h, tile_w, 2, 2, 2)
-    Y = Y.permute(0, 1, 2, 5, 3, 6, 4, 7).contiguous()
-    Y = Y.reshape(N_batch, C_out, tile_d * 2, tile_h * 2, tile_w * 2)
-    output = Y[:, :, :D_out, :H_out, :W_out]
-
-    if bias is not None:
-        output = output + bias.reshape(1, C_out, 1, 1, 1)
-
-    return output.contiguous()
-
-
-# ============================================================
-# Internal wrappers for each path
+# Internal wrappers
 # ============================================================
 
 def _launch_general(input_gpu, weight, bias, stride, padding, dilation, groups):
-    """Launch the general optimized kernel (Path 3)."""
+    """Launch the general kernel."""
     N_batch, C_in, D, H, W = input_gpu.shape
     C_out = weight.shape[0]
     kD, kH, kW = weight.shape[2], weight.shape[3], weight.shape[4]
@@ -539,11 +366,11 @@ def _launch_general(input_gpu, weight, bias, stride, padding, dilation, groups):
     H_out = (H + 2 * pH - dH * (kH - 1) - 1) // sH + 1
     W_out = (W + 2 * pW - dW * (kW - 1) - 1) // sW + 1
     N_pos = D_out * H_out * W_out
-    HW_out = H_out * W_out
+
+    K = C_in_g * kD * kH * kW
 
     weight_matrix = weight.reshape(C_out, -1).contiguous()
 
-    # Output: (N_batch, C_out, N_pos) — groups * M_g = C_out
     output_flat = torch.empty((N_batch, C_out, N_pos), device=DEVICE, dtype=torch.float32)
 
     grid = lambda META: (
@@ -553,17 +380,18 @@ def _launch_general(input_gpu, weight, bias, stride, padding, dilation, groups):
     )
     conv3d_general_kernel[grid](
         input_gpu, weight_matrix, output_flat,
-        M_g, N_pos, C_in_g,
+        M_g, N_pos, K,
         weight_matrix.stride(0), weight_matrix.stride(1),
         output_flat.stride(0), output_flat.stride(1), output_flat.stride(2),
         input_gpu.stride(0),
         input_gpu.stride(1), input_gpu.stride(2), input_gpu.stride(3), input_gpu.stride(4),
         D, H, W,
-        HW_out, H_out, W_out,
+        kD, kH, kW,
+        H_out, W_out,
         sD, sH, sW,
         pD, pH, pW,
         dD, dH, dW,
-        kD=kD, kH=kH, kW=kW,
+        C_in_g,
     )
 
     if bias is not None:
@@ -573,7 +401,7 @@ def _launch_general(input_gpu, weight, bias, stride, padding, dilation, groups):
 
 
 def _launch_depthwise(input_gpu, weight, bias, stride, padding, dilation):
-    """Launch the depthwise kernel (Path 2)."""
+    """Launch the depthwise kernel."""
     N_batch, C, D, H, W = input_gpu.shape
     kD, kH, kW = weight.shape[2], weight.shape[3], weight.shape[4]
 
@@ -589,7 +417,6 @@ def _launch_depthwise(input_gpu, weight, bias, stride, padding, dilation):
 
     weight_flat = weight.reshape(C, -1).contiguous()
 
-    # Output: (N_batch, C, N_pos)
     output_flat = torch.empty((N_batch, C, N_pos), device=DEVICE, dtype=torch.float32)
 
     grid = lambda META: (C, triton.cdiv(N_pos, META["BLOCK_SIZE_N"]), N_batch)
@@ -614,7 +441,7 @@ def _launch_depthwise(input_gpu, weight, bias, stride, padding, dilation):
 
 
 # ============================================================
-# Public API: dispatcher
+# Public API
 # ============================================================
 
 def conv3d_ultimate(
@@ -629,7 +456,10 @@ def conv3d_ultimate(
     """Ultimate Conv3D — dispatches to the best kernel for the given params.
 
     Supports arbitrary batch size, stride, padding, dilation, and groups.
-    Automatically selects Winograd, depthwise, or general optimized path.
+
+    Dispatch:
+      - groups == C_in == C_out -> depthwise kernel
+      - otherwise -> general optimized kernel (flat K-loop + expanded autotuning)
 
     Args:
         input:    (N, C_in, D, H, W) input tensor.
@@ -645,28 +475,18 @@ def conv3d_ultimate(
     """
     N_batch, C_in, D, H, W = input.shape
     C_out = weight.shape[0]
-    kD, kH, kW = weight.shape[2], weight.shape[3], weight.shape[4]
 
-    # Validate
     assert C_in % groups == 0
     assert C_out % groups == 0
     assert weight.shape[1] == C_in // groups
 
-    # Move to GPU
     input_gpu = input.to(device=DEVICE, dtype=torch.float32).contiguous()
     weight_gpu = weight.to(device=DEVICE, dtype=torch.float32).contiguous()
     bias_gpu = bias.to(device=DEVICE, dtype=torch.float32) if bias is not None else None
 
-    # Path 1: Winograd for 3x3x3, stride=1, dilation=1, groups=1
-    if (kD == kH == kW == 3
-        and stride == (1, 1, 1)
-        and dilation == (1, 1, 1)
-        and groups == 1):
-        return _conv3d_winograd(input_gpu, weight_gpu, bias_gpu, padding)
-
-    # Path 2: Depthwise specialization
+    # Depthwise specialization
     if groups == C_in and groups == C_out:
         return _launch_depthwise(input_gpu, weight_gpu, bias_gpu, stride, padding, dilation)
 
-    # Path 3: General optimized
+    # General path (handles groups >= 1)
     return _launch_general(input_gpu, weight_gpu, bias_gpu, stride, padding, dilation, groups)
